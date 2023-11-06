@@ -3,13 +3,36 @@ import torch
 import argparse
 import os
 import cv2
+import glob
 import numpy as np
-
+import pickle
 from hmr2.configs import CACHE_DIR_4DHUMANS
 from hmr2.models import HMR2, download_models, load_hmr2, DEFAULT_CHECKPOINT
 from hmr2.utils import recursive_to
 from hmr2.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hmr2.utils.renderer import Renderer, cam_crop_to_full
+import roma
+import torch
+from tqdm import tqdm
+
+def aa2rot_torch(rotation_vectors):
+    """
+    Convert rotation vectors (angle-axis representation) to rotation matrices.
+    :param rotation_vectors: A torch tensor of shape (..., 3).
+    :return: A torch tensor of shape (..., 3, 3).
+    """
+    assert isinstance(rotation_vectors, torch.Tensor)
+    return roma.rotvec_to_rotmat(rotation_vectors)
+
+
+def rot2aa_torch(rotation_matrices):
+    """
+    Convert rotation matrices to rotation vectors (angle-axis representation).
+    :param rotation_matrices: A torch tensor of shape (..., 3, 3).
+    :return: A torch tensor of shape (..., 3).
+    """
+    assert isinstance(rotation_matrices, torch.Tensor)
+    return roma.rotmat_to_rotvec(rotation_matrices)
 
 LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
 
@@ -20,7 +43,7 @@ def main():
     parser.add_argument('--out_folder', type=str, default='demo_out', help='Output folder to save rendered results')
     parser.add_argument('--side_view', dest='side_view', action='store_true', default=False, help='If set, render side view also')
     parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=False, help='If set, render all people together also')
-    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
+    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=True, help='If set, save meshes to disk also')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
     parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
 
@@ -53,12 +76,11 @@ def main():
     os.makedirs(args.out_folder, exist_ok=True)
 
     # Get all demo images ends with .jpg or .png
-    img_paths = [img for end in args.file_type for img in Path(args.img_folder).glob(end)]
-    
+    img_paths = sorted(glob.glob(os.path.join(args.img_folder, '*.png')))
+    all_out = []
     # Iterate over all images in folder
-    for img_path in img_paths:
+    for img_path in tqdm(img_paths):
         img_cv2 = cv2.imread(str(img_path))
-
         # Detect humans in image
         det_out = detector(img_cv2)
 
@@ -122,10 +144,31 @@ def main():
                 all_cam_t.append(cam_t)
 
                 # Save all meshes to disk
-                if args.save_mesh:
-                    camera_translation = cam_t.copy()
-                    tmesh = renderer.vertices_to_trimesh(verts, camera_translation, LIGHT_BLUE)
-                    tmesh.export(os.path.join(args.out_folder, f'{img_fn}_{person_id}.obj'))
+                # if args.save_mesh:
+                #     camera_translation = cam_t.copy()
+                #     tmesh = renderer.vertices_to_trimesh(verts, camera_translation, LIGHT_BLUE)
+                #     tmesh.export(os.path.join(args.out_folder, f'{img_fn}_{person_id}.obj'))
+            all_out.append({'model_out': out, 'camera_t_full': pred_cam_t_full})
+            print(out['pred_smpl_params']['betas'])
+    with open('demo_out/seq.pkl', 'wb') as f:
+        pickle.dump(all_out, f)
+    
+    new_out = {'body_pose': [], 'global_orient': [], 'transl': [], 'betas': []}
+    for item in all_out:
+        out = item['model_out']
+        new_out['body_pose'].append(rot2aa_torch(out['pred_smpl_params']['body_pose']).view(-1, 69).detach().cpu().numpy())
+        new_out['global_orient'].append(rot2aa_torch(out['pred_smpl_params']['global_orient']).detach().cpu().numpy())
+        new_out['transl'].append(item['camera_t_full'])
+        new_out['betas'].append(out['pred_smpl_params']['betas'].detach().cpu().numpy())
+    new_out['body_pose'] = np.concatenate(new_out['body_pose'])
+    new_out['global_orient'] = np.concatenate(new_out['global_orient']).squeeze()
+    new_out['transl'] = np.concatenate(new_out['transl'])
+    new_out['betas'] = np.concatenate(new_out['betas'])
+
+    new_out['betas'] = np.mean(new_out['betas'], axis=0).squeeze()
+    with open('demo_out/seq_final.pkl', 'wb') as f:
+        pickle.dump(new_out, f)
+        print('Dump successful')
 
         # Render front view
         if args.full_frame and len(all_verts) > 0:
